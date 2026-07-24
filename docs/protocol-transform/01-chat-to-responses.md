@@ -29,99 +29,135 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
 
 #### 总：一个真实请求长什么样
 
-下面是一个带注释的 Codex CLI 典型请求（字段来自 `transform_codex_chat.rs` 测试数据 + 补充注释）。左边是 Responses 端（本节主角），右边是转换后 Chat 端的对应物：
+下面是一个带注释的 Codex CLI 典型请求。左边是转换入口的 Responses 请求体，右边是 `responses_to_chat_completions_with_reasoning` 转换后的 Chat Completions 请求体。每个字段旁边的 `// → Chat:` 注释标注了转换映射结果和源码行号。
 
 ```jsonc
-// ==================== POST /v1/responses ====================
-// Codex CLI 发出的 Responses API 请求。注释标注了每个字段在 Chat 方向
-// 映射到的目标以及转换逻辑所在行号。
+// ═══════════════ 左侧：POST /v1/responses（Codex CLI 发出）═══════════════
+// ═══════════════ 右侧：POST /v1/chat/completions（转换后）═══════════════
 {
-  // ─── 模型标识 ──────────────────────────────
-  // → Chat: "model": "gpt-5.6"  （直接透传，line 267-269）
+  // "model" → "model"（直接透传，line 267-269）
   "model": "gpt-5.6",
 
-  // ─── 系统指令 ──────────────────────────────
-  // → Chat: messages[0] = {role:"system", content: "..."}
-  // string 直接用于 content；array[{type:"text",text:"..."}] 则拼接 \n\n。
-  // 空值不产生 system 消息。（line 272-280）
+  // "instructions" → messages[0] (role:"system", content:"...")
+  // string 直接用作 content，空值不产生 system 消息。（line 272-280）
   "instructions": "You are a coding agent. You have access to tools for reading, writing, and editing files.\n\nToday's date: 2026-07-23.",
 
-  // ─── 对话历史 ──────────────────────────────
-  // → Chat: "messages": [...] （§2.2，line 282-284）
+  // ─── "input" → "messages"（§2.2, line 282-284）─────────────────────
   "input": [
-    // ── message item（由 role 判别） ──────
-    // → Chat: {role:"user"|"assistant", content:"..."}
+    // message 由 role 判别 → {role:"user"|"assistant", content:"..."}
     {"role": "user", "content": "Read README.md"},
 
-    // ── function_call item ────────────────
-    // → Chat: assistant.tool_calls[] 内的一个元素（line 602-746）
+    // function_call → assistant.tool_calls[] 内的一个元素（line 602-746）
     {"type": "function_call", "call_id": "call_1", "name": "read_file",
      "arguments": "{\"path\":\"README.md\"}"},
 
-    // ── function_call_output item ─────────
-    // → Chat: 独立 {role:"tool", tool_call_id:..., content:...}
+    // function_call_output → 独立 role:"tool" 消息
     {"type": "function_call_output", "call_id": "call_1",
      "output": "Readme content"},
 
-    // ── reasoning item ────────────────────
-    // → Chat: assistant 消息的 reasoning_content 扩展字段（纯文本摘要，有损）
+    // reasoning → reasoning_content 纯文本扩展字段（有损，丢 id/encrypted_content）
     {"type": "reasoning", "id": "rs_1",
      "summary": [{"type": "summary_text", "text": "现在我知道文件内容了"}]},
 
-    // ── custom_tool_call item ─────────────
-    // → Chat: function tool call，自由输入被包进 {"input":"..."} （§2.4）
+    // custom_tool_call → function tool call，自由输入包进 {"input":"..."}（§2.4）
     {"type": "custom_tool_call", "call_id": "call_patch", "name": "apply_patch",
      "input": "*** Begin Patch\n@@ -1,3 +1,4 @@\n*** End Patch"}
-
-    // 其余 input item 类型见下方 type 速查表
   ],
 
-  // ─── 工具定义 ──────────────────────────────
-  // → Chat: "tools": [{type:"function", function:{name,description,parameters}}]
-  // Responses 的 parameters 提升进 function 对象内部；
-  // Codex 专有类型（custom / shell_command / web_search_preview）
-  // 被伪装成普通 function。（§2.4，通过 CodexToolContext 间接触发）
+  // ─── "tools" → "tools"（§2.4, CodexToolContext 间接触发）──────────
+  // Responses parameters → Chat function.parameters（扁平 → 嵌套进 function 对象）
+  // Codex 专有 type（custom / shell_command / web_search_preview）被伪装成 function
   "tools": [
     {"type": "function", "name": "get_weather", "description": "获取指定城市的天气信息",
-     "parameters": {
-       "type": "object",
-       "properties": {"city": {"type": "string", "description": "城市名称"}},
-       "required": ["city"]
-     }},
+     "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "城市名称"}}, "required": ["city"]}},
     {"type": "custom", "name": "apply_patch"},
     {"type": "shell_command", "name": "shell_command"}
   ],
 
-  // ─── 工具选择策略 ──────────────────────────
-  // → Chat: "tool_choice" （§2.6，line 316-318）
-  // string 值直接透传；object 值做类型映射：
-  //   {type:"function",name:"X"}      → {type:"function",function:{name:"X"}}
-  //   {type:"custom",name:"X"}        → 同上（伪装成 function）
+  // "tool_choice" → "tool_choice"（§2.6, line 316-318）
+  // {type:"function",name:"X"} → {type:"function",function:{name:"X"}}
+  // {type:"custom",name:"X"} → 同上（伪装成 function）
   "tool_choice": "auto",
 
-  // ─── 最大输出 token ────────────────────────
-  // → Chat: o-series 模型 → "max_completion_tokens"，其余 → "max_tokens"
+  // "max_output_tokens" → o-series: "max_completion_tokens", 其余: "max_tokens"
   // （line 289-295）
   "max_output_tokens": 32000,
 
-  // ─── Reasoning 控制 ────────────────────────
-  // → Chat: reasoning_effort（或按 CodexChatReasoningConfig 映射为
-  //   thinking / reasoning.effort 等供应商特有参数）
-  // （apply_reasoning_options，line 349+）
+  // "reasoning" → "reasoning_effort"（apply_reasoning_options, line 349+）
+  // reasoning.effort → reasoning_effort；供应商特定时走 CodexChatReasoningConfig 映射
   "reasoning": {"effort": "high"},
 
-  // ─── 直接透传参数 ──────────────────────────
-  // 以下字段在 Responses 和 Chat 中语义一致，原样传递（line 303）
+  // ─── 直接透传参数（line 303）────────────────────────────────────────
   "stream": true,
-  "temperature": 0.7,        // GPT-5.4+ 只能配合 reasoning.effort="none" 使用，
-  "top_p": 0.9,              // 否则服务端拒绝。（见下方"关于 temperature"说明）
+  "temperature": 0.7,       // GPT-5.4+ 需 reasoning.effort="none"
+  "top_p": 0.9,             // 否则 400（见下方说明）
 
-  // ─── 扩展透传参数 ──────────────────────────
-  // EXTRA_CHAT_PASSTHROUGH_FIELDS 列表中的字段直接复制
-  // （line 320-324）：frequency_penalty, logit_bias, logprobs, metadata,
-  //  n, parallel_tool_calls, presence_penalty, response_format, seed,
-  //  service_tier, stop, stream_options, top_logprobs, user
+  // ─── 扩展透传参数（EXTRA_CHAT_PASSTHROUGH_FIELDS, line 320-324）─────
+  // frequency_penalty / logit_bias / logprobs / metadata / n /
+  // parallel_tool_calls / presence_penalty / response_format / seed /
+  // service_tier / stop / stream_options / top_logprobs / user
   "parallel_tool_calls": true
+}
+
+// ═══════════════════ 转换后：POST /v1/chat/completions ═══════════════════
+{
+  "model": "gpt-5.6",
+
+  "messages": [
+    // instructions 转为 system 消息（空值跳过）
+    {"role": "system", "content": "You are a coding agent. You have access to tools for reading, writing, and editing files.\n\nToday's date: 2026-07-23."},
+
+    // input[] → messages[]：message 一对一映射
+    {"role": "user", "content": "Read README.md"},
+
+    // function_call → assistant.tool_calls[]（并行调用合并进同一条）
+    {"role": "assistant", "tool_calls": [
+      {"id": "call_1", "type": "function",
+       "function": {"name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"}},
+      {"id": "call_patch", "type": "function",
+       "function": {"name": "apply_patch",
+                    "arguments": "{\"input\":\"*** Begin Patch\\n@@ -1,3 +1,4 @@\\n*** End Patch\"}"}}
+    ], "reasoning_content": "现在我知道文件内容了"},
+
+    // function_call_output → role:"tool" 独立消息
+    {"role": "tool", "tool_call_id": "call_1", "content": "Readme content"}
+  ],
+
+  // tools: parameters 提升进 function 内部，custom/shell_command 伪装成 function
+  "tools": [
+    {"type": "function", "function": {
+      "name": "get_weather",
+      "description": "获取指定城市的天气信息",
+      "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "城市名称"}}, "required": ["city"]}
+    }},
+    {"type": "function", "function": {
+      "name": "apply_patch",
+      "description": "Original tool definition:\n```json\n{\"type\":\"custom\",\"name\":\"apply_patch\"}\n```",
+      "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description."}}, "required": ["input"]}
+    }},
+    {"type": "function", "function": {
+      "name": "shell_command",
+      "description": "Shell command execution tool",
+      "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The shell command to execute"}, "working_directory": {"type": "string", "description": "The working directory"}}, "required": ["command"]}
+    }}
+  ],
+
+  "tool_choice": "auto",
+
+  "max_tokens": 32000,
+
+  "reasoning_effort": "high",
+
+  "stream": true,
+  "temperature": 0.7,
+  "top_p": 0.9,
+
+  "parallel_tool_calls": true,
+
+  // stream=true 时 cc-switch 主动注入 stream_options.include_usage 以
+  // 在 SSE 末尾收 usage chunk（line 241-256）
+  "stream_options": {"include_usage": true}
 }
 ```
 
