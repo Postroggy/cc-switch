@@ -13,7 +13,16 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
 2. **能力差异**：Responses 有 `reasoning` item（完整结构化思考过程）、`custom_tool_call`（自由格式工具）、`tool_search_call`（内置工具发现机制），Chat Completions 一个都没有，只能靠伪装或丢弃。
 3. **供应商差异**：即使都是"Chat Completions"，DeepSeek、MiniMax、Moonshot 各自还有非标准的强制要求（比如 MiniMax 不允许 system 消息出现在非首位），转换层要在生成合法请求的同时兼顾这些供应商特例。
 
-设计上这个模块遵循"**让下游看起来像被原生调用，同时尽量不丢 Codex 语义**"的思路：能保留的信息（工具类型、call id、reasoning 文本）尽量保留在扩展字段里；协议里根本没有对应物的信息（reasoning item 的 `id`/`encrypted_content`、结构化 summary part）只能丢弃，转换是**有损**的。这是本篇和 `05-reasoning-thinking-tools-cross-protocol.md`（无损的 reasoning_bridge 机制）最本质的区别——那篇讲的是 Anthropic↔Responses 桥接，靠 base64 编码做到完全无损往返；这一篇的 Chat 方向，因为 Chat Completions 协议本身没有承载结构化 reasoning 的字段，只能退化成纯文本摘要。
+设计上这个模块遵循"**让下游看起来像被原生调用，同时尽量不丢 Codex 语义**"的思路：能保留的信息（工具类型、call id、参数）尽量保留；协议里根本没有对应物的信息只能降级。
+
+**两个方向都有损，但程度不同**：
+
+| 方向 | 转换函数 | 有损内容 |
+|---|---|---|
+| **请求**：Responses → Chat | `responses_to_chat_completions_with_reasoning`（line 260） | `reasoning` item 退化为 `reasoning_content` 纯文本（丢 `id`/`encrypted_content`/结构化 `summary`）；`custom_tool_call`/`tool_search_call` 伪装成 function |
+| **响应**：Chat → Responses | `chat_completion_to_response`（line 1307） | `reasoning_content` → 重建的 `reasoning` item（`id` 为自生成、无 `encrypted_content`、summary 退化为单个扁平 part）；Chat 本身就不存在的信息（`encrypted_content`）当然也无法凭空造出 |
+
+响应方向稍"好"的一点是：借助 `CodexToolContext` 的记忆，伪装成 function 的 custom/tool_search 可以被**还原**成原始类型——这是因为 §2.4 的伪装策略是"定义写入 description"的**自描述**方式，反向时能从 description 里解码出原始定义。请求方向则没有这种还原路径——Codex CLI 从上游收到的是 ReconstructedChat 响应，里面的 `reasoning_content` 文本再也变不回结构化的 reasoning item。这是本篇和 `05-reasoning-thinking-tools-cross-protocol.md`（无损的 reasoning_bridge 机制）最本质的区别——那篇讲的是 Anthropic↔Responses 桥接，靠 base64 编码做到完全无损往返；这一篇的 Chat 方向，因为 Chat Completions 协议本身没有承载结构化 reasoning 的字段，只能退化成纯文本摘要。
 
 下面按请求方向（Responses → Chat）、响应方向（Chat → Responses）两条主线展开，每条主线内部再按"消息映射 → 工具映射 → reasoning 映射 → 边界情况"的顺序讲清楚。
 
@@ -59,19 +68,33 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
      "name": "read_file",
      "arguments": "{\"path\":\"README.md\"}"},
 
+    // function_call（with namespace）→ 扁平工具名 mcp__xxx__name（§2.5）
+    {"type": "function_call", "call_id": "call_2", "name": "search",
+     "namespace": "mcp__gmail",
+     "arguments": "{\"query\":\"inbox\"}"},
+
     // function_call_output→role:"tool"
     {"type": "function_call_output",
      "call_id": "call_1", "output": "Readme content"},
 
-    // reasoning→reasoning_content（有损）
+    // function_call_output (is_error)→role:"tool"（error marker 丢失）
+    {"type": "function_call_output",
+     "call_id": "call_2", "output": "permission denied",
+     "is_error": true},
+
+    // reasoning→reasoning_content（有损，丢 id/encrypted_content）
     {"type": "reasoning", "id": "rs_1",
      "summary": [{"type": "summary_text",
       "text": "现在我知道文件内容了"}]},
 
-    // custom_tool_call→function（§2.4）
+    // custom_tool_call→function（自由输入包进 {"input":"..."}, §2.4）
     {"type": "custom_tool_call", "call_id": "call_patch",
      "name": "apply_patch",
-     "input": "*** Begin Patch\n@@ -1,3 +1,4 @@\n*** End Patch"}
+     "input": "*** Begin Patch\n@@ -1,3 +1,4 @@\n*** End Patch"},
+
+    // tool_search_call→function（伪装成名为 tool_search 的 function, §2.4）
+    {"type": "tool_search_call", "call_id": "call_ts_1",
+     "arguments": {"query": "Gmail", "limit": 5}}
   ],
 
   // → Chat: "tools"（§2.4, CodexToolContext）
@@ -82,7 +105,8 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
       "properties": {"city": {"type": "string"}},
       "required": ["city"]}},
     {"type": "custom", "name": "apply_patch"},
-    {"type": "shell_command", "name": "shell_command"}
+    {"type": "shell_command", "name": "shell_command"},
+    {"type": "web_search_preview", "name": "web_search"}      // Codex 内置工具
   ],
 
   // → Chat: "tool_choice"（§2.6, line 316-318）
@@ -119,23 +143,33 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
     // message item 一对一映射
     {"role": "user", "content": "Read README.md"},
 
-    // function_call→assistant.tool_calls[]（并行合并）
-    // reasoning→reasoning_content 附着在同一条消息上
+    // function_call→assistant.tool_calls[]（并行合并进同一条）
+    // reasoning→reasoning_content 附着在同一条 assistant 消息上
+    // namespace 被展平为扁平工具名（§2.5）
     {"role": "assistant",
      "tool_calls": [
        {"id": "call_1", "type": "function",
         "function": {"name": "read_file",
          "arguments": "{\"path\":\"README.md\"}"}},
+       {"id": "call_2", "type": "function",
+        "function": {"name": "mcp__gmail__search",
+         "arguments": "{\"query\":\"inbox\"}"}},
        {"id": "call_patch", "type": "function",
         "function": {"name": "apply_patch",
-         "arguments": "{\"input\":\"*** Begin Patch\\n...\\n*** End Patch\"}"}}
+         "arguments": "{\"input\":\"*** Begin Patch\\n...\\n*** End Patch\"}"}},
+       {"id": "call_ts_1", "type": "function",
+        "function": {"name": "tool_search",
+         "arguments": "{\"query\":\"Gmail\",\"limit\":5}"}}
      ],
      "reasoning_content": "现在我知道文件内容了"
     },
 
     // function_call_output→独立 role:"tool"
     {"role": "tool", "tool_call_id": "call_1",
-     "content": "Readme content"}
+     "content": "Readme content"},
+    // is_error→content 降级为纯文本字符串（marker 信息丢失）
+    {"role": "tool", "tool_call_id": "call_2",
+     "content": "permission denied"}
   ],
 
   "tools": [
@@ -162,6 +196,16 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
       "parameters": {"type": "object",
        "properties": {"command": {"type": "string"}, "working_directory": {"type": "string"}},
        "required": ["command"]}
+    }},
+    // web_search_preview→function（伪装，参数固定为 query + limit）
+    // tool_search_call 响应方向靠 CodexToolContext 还原原始类型
+    {"type": "function", "function": {
+      "name": "tool_search",
+      "description": "Search for available tools matching the given description",
+      "parameters": {"type": "object",
+       "properties": {"query": {"type": "string"},
+         "limit": {"type": "integer"}},
+       "required": ["query"]}
     }}
   ],
 
