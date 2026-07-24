@@ -29,25 +29,26 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
 
 #### 总：一个真实请求长什么样
 
-下面是一个带注释的 Codex CLI 典型请求。左边是转换入口的 Responses 请求体，右边是 `responses_to_chat_completions_with_reasoning` 转换后的 Chat Completions 请求体。每个字段旁边的 `// → Chat:` 注释标注了转换映射结果和源码行号。
+下面两段分别是 `responses_to_chat_completions_with_reasoning` 的**输入**和**输出**，上下对照。
+
+**输入：`POST /v1/responses`（Codex CLI → cc-switch）**
 
 ```jsonc
-// ═══════════════ 左侧：POST /v1/responses（Codex CLI 发出）═══════════════
-// ═══════════════ 右侧：POST /v1/chat/completions（转换后）═══════════════
+// 每个字段的注释标注了转换后目标以及对应源码行号。
 {
-  // "model" → "model"（直接透传，line 267-269）
+  // → Chat: "model"（直接透传，line 267-269）
   "model": "gpt-5.6",
 
-  // "instructions" → messages[0] (role:"system", content:"...")
+  // → Chat: messages[0] = {role:"system", content:"..."}
   // string 直接用作 content，空值不产生 system 消息。（line 272-280）
   "instructions": "You are a coding agent. You have access to tools for reading, writing, and editing files.\n\nToday's date: 2026-07-23.",
 
-  // ─── "input" → "messages"（§2.2, line 282-284）─────────────────────
+  // → Chat: "messages": [...]（§2.2, line 282-284）
   "input": [
-    // message 由 role 判别 → {role:"user"|"assistant", content:"..."}
+    // message 由 role 判别
     {"role": "user", "content": "Read README.md"},
 
-    // function_call → assistant.tool_calls[] 内的一个元素（line 602-746）
+    // function_call → assistant.tool_calls[]（line 602-746）
     {"type": "function_call", "call_id": "call_1", "name": "read_file",
      "arguments": "{\"path\":\"README.md\"}"},
 
@@ -55,62 +56,59 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
     {"type": "function_call_output", "call_id": "call_1",
      "output": "Readme content"},
 
-    // reasoning → reasoning_content 纯文本扩展字段（有损，丢 id/encrypted_content）
+    // reasoning → reasoning_content 纯文本（有损，丢 id/encrypted_content）
     {"type": "reasoning", "id": "rs_1",
      "summary": [{"type": "summary_text", "text": "现在我知道文件内容了"}]},
 
-    // custom_tool_call → function tool call，自由输入包进 {"input":"..."}（§2.4）
+    // custom_tool_call → function tool call, 自由输入包进 {"input":"..."}（§2.4）
     {"type": "custom_tool_call", "call_id": "call_patch", "name": "apply_patch",
      "input": "*** Begin Patch\n@@ -1,3 +1,4 @@\n*** End Patch"}
   ],
 
-  // ─── "tools" → "tools"（§2.4, CodexToolContext 间接触发）──────────
-  // Responses parameters → Chat function.parameters（扁平 → 嵌套进 function 对象）
-  // Codex 专有 type（custom / shell_command / web_search_preview）被伪装成 function
+  // → Chat: "tools"（§2.4, CodexToolContext 间接触发）
+  // Responses 扁平 parameters → Chat function.parameters（嵌套进 function 对象）
+  // custom / shell_command / web_search_preview → 伪装成 function
   "tools": [
     {"type": "function", "name": "get_weather", "description": "获取指定城市的天气信息",
-     "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "城市名称"}}, "required": ["city"]}},
+     "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
     {"type": "custom", "name": "apply_patch"},
     {"type": "shell_command", "name": "shell_command"}
   ],
 
-  // "tool_choice" → "tool_choice"（§2.6, line 316-318）
-  // {type:"function",name:"X"} → {type:"function",function:{name:"X"}}
-  // {type:"custom",name:"X"} → 同上（伪装成 function）
+  // → Chat: "tool_choice"（§2.6, line 316-318）
   "tool_choice": "auto",
 
-  // "max_output_tokens" → o-series: "max_completion_tokens", 其余: "max_tokens"
-  // （line 289-295）
+  // → Chat: o-series "max_completion_tokens"，其余 "max_tokens"（line 289-295）
   "max_output_tokens": 32000,
 
-  // "reasoning" → "reasoning_effort"（apply_reasoning_options, line 349+）
-  // reasoning.effort → reasoning_effort；供应商特定时走 CodexChatReasoningConfig 映射
+  // → Chat: "reasoning_effort"（apply_reasoning_options, line 349+）
   "reasoning": {"effort": "high"},
 
-  // ─── 直接透传参数（line 303）────────────────────────────────────────
+  // → Chat: 直接透传（line 303）
   "stream": true,
   "temperature": 0.7,       // GPT-5.4+ 需 reasoning.effort="none"
-  "top_p": 0.9,             // 否则 400（见下方说明）
+  "top_p": 0.9,
 
-  // ─── 扩展透传参数（EXTRA_CHAT_PASSTHROUGH_FIELDS, line 320-324）─────
-  // frequency_penalty / logit_bias / logprobs / metadata / n /
-  // parallel_tool_calls / presence_penalty / response_format / seed /
-  // service_tier / stop / stream_options / top_logprobs / user
+  // → Chat: 直接透传（EXTRA_CHAT_PASSTHROUGH_FIELDS, line 320-324）
   "parallel_tool_calls": true
 }
+```
 
-// ═══════════════════ 转换后：POST /v1/chat/completions ═══════════════════
+**输出：`POST /v1/chat/completions`（cc-switch → 上游 Chat 供应商）**
+
+```jsonc
 {
   "model": "gpt-5.6",
 
   "messages": [
-    // instructions 转为 system 消息（空值跳过）
+    // instructions → system 消息（空值跳过）
     {"role": "system", "content": "You are a coding agent. You have access to tools for reading, writing, and editing files.\n\nToday's date: 2026-07-23."},
 
-    // input[] → messages[]：message 一对一映射
+    // message item 一对一映射
     {"role": "user", "content": "Read README.md"},
 
     // function_call → assistant.tool_calls[]（并行调用合并进同一条）
+    // reasoning → reasoning_content 附着在同一条 assistant 消息上
     {"role": "assistant", "tool_calls": [
       {"id": "call_1", "type": "function",
        "function": {"name": "read_file",
@@ -120,7 +118,7 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
                     "arguments": "{\"input\":\"*** Begin Patch\\n@@ -1,3 +1,4 @@\\n*** End Patch\"}"}}
     ], "reasoning_content": "现在我知道文件内容了"},
 
-    // function_call_output → role:"tool" 独立消息
+    // function_call_output → 独立 role:"tool" 消息
     {"role": "tool", "tool_call_id": "call_1", "content": "Readme content"}
   ],
 
@@ -129,24 +127,23 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
     {"type": "function", "function": {
       "name": "get_weather",
       "description": "获取指定城市的天气信息",
-      "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "城市名称"}}, "required": ["city"]}
+      "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
     }},
     {"type": "function", "function": {
       "name": "apply_patch",
       "description": "Original tool definition:\n```json\n{\"type\":\"custom\",\"name\":\"apply_patch\"}\n```",
-      "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description."}}, "required": ["input"]}
+      "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "Raw string input for the original custom tool."}}, "required": ["input"]}
     }},
     {"type": "function", "function": {
       "name": "shell_command",
       "description": "Shell command execution tool",
-      "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The shell command to execute"}, "working_directory": {"type": "string", "description": "The working directory"}}, "required": ["command"]}
+      "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "working_directory": {"type": "string"}}, "required": ["command"]}
     }}
   ],
 
   "tool_choice": "auto",
 
   "max_tokens": 32000,
-
   "reasoning_effort": "high",
 
   "stream": true,
@@ -155,8 +152,8 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
 
   "parallel_tool_calls": true,
 
-  // stream=true 时 cc-switch 主动注入 stream_options.include_usage 以
-  // 在 SSE 末尾收 usage chunk（line 241-256）
+  // stream=true 时 cc-switch 主动注入 stream_options.include_usage
+  // 确保 SSE 末尾收到 usage chunk（inject_openai_stream_include_usage, line 241-256）
   "stream_options": {"include_usage": true}
 }
 ```
