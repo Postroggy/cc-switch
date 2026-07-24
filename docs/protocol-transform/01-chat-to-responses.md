@@ -29,48 +29,58 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
 
 #### 总：一个真实请求长什么样
 
-下面两段分别是 `responses_to_chat_completions_with_reasoning` 的**输入**和**输出**，上下对照。
+下面左右对照展示 `responses_to_chat_completions_with_reasoning` 的输入和输出。
 
-**输入：`POST /v1/responses`（Codex CLI → cc-switch）**
+<table>
+<tr>
+<td width="50%"><b>输入：POST /v1/responses</b><br><em>（Codex CLI → cc-switch）</em></td>
+<td width="50%"><b>输出：POST /v1/chat/completions</b><br><em>（cc-switch → 上游 Chat 供应商）</em></td>
+</tr>
+<tr>
+<td>
 
 ```jsonc
-// 每个字段的注释标注了转换后目标以及对应源码行号。
+// 注释标注转换目标 + 源码行号
 {
-  // → Chat: "model"（直接透传，line 267-269）
+  // → Chat: "model"（line 267-269）
   "model": "gpt-5.6",
 
-  // → Chat: messages[0] = {role:"system", content:"..."}
-  // string 直接用作 content，空值不产生 system 消息。（line 272-280）
-  "instructions": "You are a coding agent. You have access to tools for reading, writing, and editing files.\n\nToday's date: 2026-07-23.",
+  // → Chat: messages[0]=system
+  // string→content, 空值跳过（line 272-280）
+  "instructions": "You are a coding agent...",
 
-  // → Chat: "messages": [...]（§2.2, line 282-284）
+  // → Chat: "messages"（§2.2, line 282-284）
   "input": [
-    // message 由 role 判别
+    // message→{role, content}
     {"role": "user", "content": "Read README.md"},
 
-    // function_call → assistant.tool_calls[]（line 602-746）
-    {"type": "function_call", "call_id": "call_1", "name": "read_file",
+    // function_call→assistant.tool_calls[]（line 602-746）
+    {"type": "function_call", "call_id": "call_1",
+     "name": "read_file",
      "arguments": "{\"path\":\"README.md\"}"},
 
-    // function_call_output → 独立 role:"tool" 消息
-    {"type": "function_call_output", "call_id": "call_1",
-     "output": "Readme content"},
+    // function_call_output→role:"tool"
+    {"type": "function_call_output",
+     "call_id": "call_1", "output": "Readme content"},
 
-    // reasoning → reasoning_content 纯文本（有损，丢 id/encrypted_content）
+    // reasoning→reasoning_content（有损）
     {"type": "reasoning", "id": "rs_1",
-     "summary": [{"type": "summary_text", "text": "现在我知道文件内容了"}]},
+     "summary": [{"type": "summary_text",
+      "text": "现在我知道文件内容了"}]},
 
-    // custom_tool_call → function tool call, 自由输入包进 {"input":"..."}（§2.4）
-    {"type": "custom_tool_call", "call_id": "call_patch", "name": "apply_patch",
+    // custom_tool_call→function（§2.4）
+    {"type": "custom_tool_call", "call_id": "call_patch",
+     "name": "apply_patch",
      "input": "*** Begin Patch\n@@ -1,3 +1,4 @@\n*** End Patch"}
   ],
 
-  // → Chat: "tools"（§2.4, CodexToolContext 间接触发）
-  // Responses 扁平 parameters → Chat function.parameters（嵌套进 function 对象）
-  // custom / shell_command / web_search_preview → 伪装成 function
+  // → Chat: "tools"（§2.4, CodexToolContext）
   "tools": [
-    {"type": "function", "name": "get_weather", "description": "获取指定城市的天气信息",
-     "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
+    {"type": "function", "name": "get_weather",
+     "description": "获取指定城市的天气信息",
+     "parameters": {"type": "object",
+      "properties": {"city": {"type": "string"}},
+      "required": ["city"]}},
     {"type": "custom", "name": "apply_patch"},
     {"type": "shell_command", "name": "shell_command"}
   ],
@@ -78,66 +88,80 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
   // → Chat: "tool_choice"（§2.6, line 316-318）
   "tool_choice": "auto",
 
-  // → Chat: o-series "max_completion_tokens"，其余 "max_tokens"（line 289-295）
+  // → Chat: "max_tokens"（line 289-295）
   "max_output_tokens": 32000,
 
-  // → Chat: "reasoning_effort"（apply_reasoning_options, line 349+）
+  // → Chat: "reasoning_effort"（line 349+）
   "reasoning": {"effort": "high"},
 
   // → Chat: 直接透传（line 303）
   "stream": true,
-  "temperature": 0.7,       // GPT-5.4+ 需 reasoning.effort="none"
+  "temperature": 0.7,
   "top_p": 0.9,
 
-  // → Chat: 直接透传（EXTRA_CHAT_PASSTHROUGH_FIELDS, line 320-324）
+  // → Chat: 直接透传（line 320-324）
   "parallel_tool_calls": true
 }
 ```
 
-**输出：`POST /v1/chat/completions`（cc-switch → 上游 Chat 供应商）**
+</td>
+<td>
 
 ```jsonc
 {
   "model": "gpt-5.6",
 
   "messages": [
-    // instructions → system 消息（空值跳过）
-    {"role": "system", "content": "You are a coding agent. You have access to tools for reading, writing, and editing files.\n\nToday's date: 2026-07-23."},
+    // instructions→system 消息（空值跳过）
+    {"role": "system",
+     "content": "You are a coding agent..."},
 
     // message item 一对一映射
     {"role": "user", "content": "Read README.md"},
 
-    // function_call → assistant.tool_calls[]（并行调用合并进同一条）
-    // reasoning → reasoning_content 附着在同一条 assistant 消息上
-    {"role": "assistant", "tool_calls": [
-      {"id": "call_1", "type": "function",
-       "function": {"name": "read_file",
-                    "arguments": "{\"path\":\"README.md\"}"}},
-      {"id": "call_patch", "type": "function",
-       "function": {"name": "apply_patch",
-                    "arguments": "{\"input\":\"*** Begin Patch\\n@@ -1,3 +1,4 @@\\n*** End Patch\"}"}}
-    ], "reasoning_content": "现在我知道文件内容了"},
+    // function_call→assistant.tool_calls[]（并行合并）
+    // reasoning→reasoning_content 附着在同一条消息上
+    {"role": "assistant",
+     "tool_calls": [
+       {"id": "call_1", "type": "function",
+        "function": {"name": "read_file",
+         "arguments": "{\"path\":\"README.md\"}"}},
+       {"id": "call_patch", "type": "function",
+        "function": {"name": "apply_patch",
+         "arguments": "{\"input\":\"*** Begin Patch\\n...\\n*** End Patch\"}"}}
+     ],
+     "reasoning_content": "现在我知道文件内容了"
+    },
 
-    // function_call_output → 独立 role:"tool" 消息
-    {"role": "tool", "tool_call_id": "call_1", "content": "Readme content"}
+    // function_call_output→独立 role:"tool"
+    {"role": "tool", "tool_call_id": "call_1",
+     "content": "Readme content"}
   ],
 
-  // tools: parameters 提升进 function 内部，custom/shell_command 伪装成 function
   "tools": [
+    // function→function{name,desc,params}（嵌套提升）
     {"type": "function", "function": {
       "name": "get_weather",
       "description": "获取指定城市的天气信息",
-      "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+      "parameters": {"type": "object",
+       "properties": {"city": {"type": "string"}},
+       "required": ["city"]}
     }},
+    // custom→function（伪装，定义写入 description）
     {"type": "function", "function": {
       "name": "apply_patch",
-      "description": "Original tool definition:\n```json\n{\"type\":\"custom\",\"name\":\"apply_patch\"}\n```",
-      "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "Raw string input for the original custom tool."}}, "required": ["input"]}
+      "description": "Original tool definition:\n```json\n{\"type\":\"custom\",...}\n```",
+      "parameters": {"type": "object",
+       "properties": {"input": {"type": "string", "description": "Raw string input..."}},
+       "required": ["input"]}
     }},
+    // shell_command→function
     {"type": "function", "function": {
       "name": "shell_command",
       "description": "Shell command execution tool",
-      "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "working_directory": {"type": "string"}}, "required": ["command"]}
+      "parameters": {"type": "object",
+       "properties": {"command": {"type": "string"}, "working_directory": {"type": "string"}},
+       "required": ["command"]}
     }}
   ],
 
@@ -152,11 +176,14 @@ Codex CLI 只会说 OpenAI Responses 协议：请求体是扁平的 `input` 数�
 
   "parallel_tool_calls": true,
 
-  // stream=true 时 cc-switch 主动注入 stream_options.include_usage
-  // 确保 SSE 末尾收到 usage chunk（inject_openai_stream_include_usage, line 241-256）
+  // stream=true 时 cc-switch 注入
   "stream_options": {"include_usage": true}
 }
 ```
+
+</td>
+</tr>
+</table>
 
 > **关于 `temperature`**：根据 [GPT-5.4 参数兼容性文档](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.4)，`temperature` 和 `top_p` 是 Responses API 的合法字段，但 **GPT-5.4 及之后版本只在 `reasoning.effort = "none"` 时才接受这些传统采样参数**，传入其他 effort 值会导致硬错误（400）。cc-switch 转换代码（line 303）对它们做无条件透传，是否实际发送由上游客户端决定。
 
